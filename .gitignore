@@ -12,9 +12,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Models and data (avoid pushing large files to GitHub)
+# Data and output (avoid pushing large files to GitHub)
 data/
-models_saved/
 output/
 
 # IDEs

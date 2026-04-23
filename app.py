@@ -19,15 +19,17 @@ import io
 import json
 import time
 import random
-import threading
 import warnings
 
 warnings.filterwarnings("ignore")
 
 # Force UTF-8 on Windows
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -45,14 +47,13 @@ from config import (
 app = Flask(__name__)
 
 # ---------------------------------------------------------------
-# Global state (thread-safe)
+# Global state
 # ---------------------------------------------------------------
-lock = threading.Lock()
 state = {
-    "packets": [],        # last N processed packets
+    "packets": [],
     "total_normal": 0,
     "total_anomaly": 0,
-    "running": True,
+    "pkt_id": 0,
     "models_loaded": False,
 }
 
@@ -92,28 +93,23 @@ def load_models():
 
 
 # ---------------------------------------------------------------
-# Background thread: simulate incoming packets
+# On-the-fly packet generator (serverless-compatible)
 # ---------------------------------------------------------------
-def packet_simulator():
-    """Generate fake packets every second and classify them."""
-    pkt_id = 0
-    while state["running"]:
-        pkt_id += 1
+def generate_packets(n=3):
+    """Generate n packets on each API call instead of using a background thread."""
+    for _ in range(n):
+        state["pkt_id"] += 1
 
         if state["models_loaded"] and scaler is not None and hybrid_model is not None and test_data is not None:
-            # Replay a random packet from the actual test data
             X_test_np = test_data["X_test_unscaled"]
-            y_test_np = test_data["y_test"]
-            
             row_idx = random.randint(0, len(X_test_np) - 1)
             raw_features = X_test_np[row_idx]
-            
+
             duration = float(raw_features[0])
             src_bytes = int(raw_features[1])
             dst_bytes = int(raw_features[2])
-            # Assuming protocol_type_enc is one of the last few columns, pick string randomly for display
             protocol = random.choice(["TCP", "UDP", "ICMP"])
-            
+
             scaled = scaler.transform(raw_features.reshape(1, -1))
             iso_score = iso_model.decision_scores(scaled)
             km_dist = kmeans_model.centroid_distances(scaled)
@@ -123,17 +119,15 @@ def packet_simulator():
             score = float(hybrid_score[0])
             label = "ANOMALY" if score >= hybrid_model.base_threshold else "NORMAL"
         else:
-            # Fallback: random classification
             duration = round(random.uniform(0.0, 50.0), 2)
             src_bytes = random.randint(0, 50000)
             dst_bytes = random.randint(0, 50000)
             protocol = random.choice(["TCP", "UDP", "ICMP"])
-            
             score = round(random.uniform(0, 1), 4)
             label = "ANOMALY" if random.random() < 0.25 else "NORMAL"
 
         pkt = {
-            "id": pkt_id,
+            "id": state["pkt_id"],
             "time": time.strftime("%H:%M:%S"),
             "duration": duration,
             "src_bytes": src_bytes,
@@ -143,16 +137,13 @@ def packet_simulator():
             "label": label,
         }
 
-        with lock:
-            state["packets"].append(pkt)
-            if len(state["packets"]) > 100:
-                state["packets"] = state["packets"][-100:]
-            if label == "NORMAL":
-                state["total_normal"] += 1
-            else:
-                state["total_anomaly"] += 1
-
-        time.sleep(1.2)
+        state["packets"].append(pkt)
+        if len(state["packets"]) > 100:
+            state["packets"] = state["packets"][-100:]
+        if label == "NORMAL":
+            state["total_normal"] += 1
+        else:
+            state["total_anomaly"] += 1
 
 
 # ---------------------------------------------------------------
@@ -690,26 +681,23 @@ def index():
 
 @app.route("/api/packets")
 def api_packets():
-    """JSON API: return current packet data and stats."""
-    with lock:
-        return jsonify(
-            packets=state["packets"][-50:],  # last 50
-            total_normal=state["total_normal"],
-            total_anomaly=state["total_anomaly"],
-            models_loaded=state["models_loaded"],
-        )
+    """JSON API: generate new packets on-the-fly and return current data."""
+    generate_packets(3)
+    return jsonify(
+        packets=state["packets"][-50:],
+        total_normal=state["total_normal"],
+        total_anomaly=state["total_anomaly"],
+        models_loaded=state["models_loaded"],
+    )
 
 
 # ---------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------
-if __name__ == "__main__":
-    load_models()
+# Load models at module level so Vercel serverless picks them up
+load_models()
 
-    # Start background simulator
-    sim_thread = threading.Thread(target=packet_simulator, daemon=True)
-    sim_thread.start()
+if __name__ == "__main__":
     print(f"\n[Dashboard] Starting at http://{FLASK_HOST}:{FLASK_PORT}")
     print("[Dashboard] Press Ctrl+C to stop\n")
-
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=FLASK_DEBUG, use_reloader=False)
