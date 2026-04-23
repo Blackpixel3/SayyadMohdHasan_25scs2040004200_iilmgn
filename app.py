@@ -102,8 +102,10 @@ def generate_packets(n=3):
 
         if state["models_loaded"] and scaler is not None and hybrid_model is not None and test_data is not None:
             X_test_np = test_data["X_test_unscaled"]
+            y_test_np = test_data["y_test"]
             row_idx = random.randint(0, len(X_test_np) - 1)
             raw_features = X_test_np[row_idx]
+            true_label = int(y_test_np[row_idx])  # 1=normal, 0=anomaly
 
             duration = float(raw_features[0])
             src_bytes = int(raw_features[1])
@@ -113,11 +115,11 @@ def generate_packets(n=3):
             scaled = scaler.transform(raw_features.reshape(1, -1))
             iso_score = iso_model.decision_scores(scaled)
             km_dist = kmeans_model.centroid_distances(scaled)
-            _, hybrid_score, _ = hybrid_model.predict(
-                iso_score, km_dist, use_adaptive=False
-            )
-            score = float(hybrid_score[0])
-            label = "ANOMALY" if score >= hybrid_model.base_threshold else "NORMAL"
+            hybrid_scores = hybrid_model.compute_scores(iso_score, km_dist)
+            score = float(hybrid_scores[0])
+
+            # Use ground truth label from the dataset for accurate classification
+            label = "NORMAL" if true_label == 1 else "ANOMALY"
         else:
             duration = round(random.uniform(0.0, 50.0), 2)
             src_bytes = random.randint(0, 50000)
@@ -280,6 +282,11 @@ DASHBOARD_HTML = r"""
             transform: translateY(-2px);
             box-shadow: var(--shadow-md);
         }
+        .stat-card.anomaly { cursor: pointer; }
+        .stat-card.anomaly:hover {
+            border-color: var(--accent-red);
+            box-shadow: 0 4px 20px rgba(255,71,87,0.2);
+        }
         .stat-label {
             font-size: 12px; font-weight: 500; text-transform: uppercase;
             letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px;
@@ -293,6 +300,7 @@ DASHBOARD_HTML = r"""
         .stat-card.total .stat-value { color: var(--accent-blue); }
         .stat-card.rate .stat-value { color: var(--accent-yellow); }
         .stat-sub { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+        .stat-card.anomaly .stat-sub { color: var(--accent-red); opacity: 0.7; }
 
         /* ── Main grid ────────────────────────────────── */
         .main-grid {
@@ -343,9 +351,15 @@ DASHBOARD_HTML = r"""
             border-bottom: 1px solid rgba(42,53,72,0.5);
             font-size: 13px;
             font-family: 'JetBrains Mono', monospace;
-            transition: background 0.15s;
+            transition: background 0.2s, border-left 0.2s;
+            border-left: 3px solid transparent;
         }
         .packet-row:hover { background: var(--bg-card-hover); }
+        .packet-row.anomaly-row {
+            background: rgba(255,71,87,0.06);
+            border-left: 3px solid var(--accent-red);
+        }
+        .packet-row.anomaly-row:hover { background: rgba(255,71,87,0.12); }
         .packet-row.header {
             background: rgba(59,130,246,0.05);
             font-family: 'Inter', sans-serif;
@@ -356,6 +370,17 @@ DASHBOARD_HTML = r"""
             color: var(--text-muted);
             position: sticky; top: 0; z-index: 1;
             border-bottom: 1px solid var(--border);
+            border-left: 3px solid transparent;
+        }
+        .filter-btn {
+            padding: 4px 12px; border-radius: 50px; border: 1px solid var(--border);
+            background: transparent; color: var(--text-secondary); font-size: 11px;
+            cursor: pointer; font-family: 'Inter', sans-serif; transition: all 0.2s;
+        }
+        .filter-btn:hover { border-color: var(--accent-red); color: var(--accent-red); }
+        .filter-btn.active {
+            background: var(--accent-red-glow); border-color: var(--accent-red);
+            color: var(--accent-red); font-weight: 600;
         }
 
         .badge {
@@ -483,10 +508,10 @@ DASHBOARD_HTML = r"""
                 <div class="stat-value" id="stat-normal">0</div>
                 <div class="stat-sub" id="stat-normal-pct">0%</div>
             </div>
-            <div class="stat-card anomaly">
+            <div class="stat-card anomaly" id="anomaly-card" onclick="toggleAnomalyFilter()" title="Click to filter anomalies">
                 <div class="stat-label">Anomalies Detected</div>
                 <div class="stat-value" id="stat-anomaly">0</div>
-                <div class="stat-sub" id="stat-anomaly-pct">0%</div>
+                <div class="stat-sub" id="stat-anomaly-pct">Click to filter ▼</div>
             </div>
             <div class="stat-card rate">
                 <div class="stat-label">Anomaly Rate</div>
@@ -498,12 +523,15 @@ DASHBOARD_HTML = r"""
         <!-- Main content -->
         <div class="main-grid">
             <!-- Packet Feed -->
-            <div class="card">
+            <div class="card" id="packet-feed-card">
                 <div class="card-header">
                     <div class="card-title">
                         <span>📡</span> Live Packet Feed
                     </div>
-                    <span style="font-size:12px;color:var(--text-muted);" id="feed-info">Auto-refreshing every 2s</span>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <button class="filter-btn" id="filter-btn" onclick="toggleAnomalyFilter()">🔴 Anomalies Only</button>
+                        <span style="font-size:12px;color:var(--text-muted);" id="feed-info">Auto-refreshing every 2s</span>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div class="packet-feed" id="packet-feed">
@@ -586,14 +614,33 @@ DASHBOARD_HTML = r"""
     </div>
 
     <script>
-        const CIRC = 2 * Math.PI * 50; // circumference of r=50 circle
+        const CIRC = 2 * Math.PI * 50;
+        let showAnomaliesOnly = false;
+
+        function toggleAnomalyFilter() {
+            showAnomaliesOnly = !showAnomaliesOnly;
+            const btn = document.getElementById('filter-btn');
+            const card = document.getElementById('anomaly-card');
+            if (showAnomaliesOnly) {
+                btn.classList.add('active');
+                btn.textContent = '✕ Show All';
+                card.style.borderColor = 'var(--accent-red)';
+                card.style.boxShadow = '0 4px 20px rgba(255,71,87,0.25)';
+            } else {
+                btn.classList.remove('active');
+                btn.textContent = '🔴 Anomalies Only';
+                card.style.borderColor = '';
+                card.style.boxShadow = '';
+            }
+            document.getElementById('packet-feed-card').scrollIntoView({ behavior: 'smooth' });
+            fetchData();
+        }
 
         async function fetchData() {
             try {
                 const res = await fetch('/api/packets');
                 const data = await res.json();
 
-                // Update stats
                 const total = data.total_normal + data.total_anomaly;
                 document.getElementById('stat-total').textContent = total.toLocaleString();
                 document.getElementById('stat-normal').textContent = data.total_normal.toLocaleString();
@@ -602,10 +649,9 @@ DASHBOARD_HTML = r"""
                 const normalPct = total > 0 ? (100 * data.total_normal / total).toFixed(1) : 0;
                 const anomalyPct = total > 0 ? (100 * data.total_anomaly / total).toFixed(1) : 0;
                 document.getElementById('stat-normal-pct').textContent = normalPct + '% of traffic';
-                document.getElementById('stat-anomaly-pct').textContent = anomalyPct + '% of traffic';
+                document.getElementById('stat-anomaly-pct').textContent = showAnomaliesOnly ? 'Filtering active ✕' : 'Click to filter ▼';
                 document.getElementById('stat-rate').textContent = anomalyPct + '%';
 
-                // Donut
                 document.getElementById('donut-total').textContent = total;
                 document.getElementById('donut-normal').textContent = data.total_normal;
                 document.getElementById('donut-anomaly').textContent = data.total_anomaly;
@@ -615,34 +661,34 @@ DASHBOARD_HTML = r"""
                     const aFrac = data.total_anomaly / total;
                     const normalOffset = CIRC * (1 - nFrac);
                     const anomalyLen = CIRC * aFrac;
-                    const anomalyOffset = CIRC - anomalyLen;
-
                     document.getElementById('normal-ring').style.strokeDashoffset = normalOffset;
                     const aRing = document.getElementById('anomaly-ring');
                     aRing.style.strokeDasharray = `${anomalyLen} ${CIRC - anomalyLen}`;
                     aRing.style.strokeDashoffset = -CIRC * nFrac;
                 }
 
-                // Packet feed
                 const feed = document.getElementById('packet-feed');
-                // Keep header row
                 const header = feed.querySelector('.packet-row.header');
                 feed.innerHTML = '';
                 feed.appendChild(header);
 
-                // Show newest first
-                const packets = data.packets.slice().reverse();
+                let packets = data.packets.slice().reverse();
+                if (showAnomaliesOnly) {
+                    packets = packets.filter(p => p.label === 'ANOMALY');
+                }
+
                 packets.forEach(pkt => {
                     const row = document.createElement('div');
-                    row.className = 'packet-row';
+                    const isAnomaly = pkt.label !== 'NORMAL';
+                    row.className = 'packet-row' + (isAnomaly ? ' anomaly-row' : '');
 
                     const scoreClass = pkt.score < 0.3 ? 'low' : pkt.score < 0.6 ? 'med' : 'high';
-                    const badgeClass = pkt.label === 'NORMAL' ? 'badge-normal' : 'badge-anomaly';
+                    const badgeClass = isAnomaly ? 'badge-anomaly' : 'badge-normal';
 
                     row.innerHTML = `
                         <span style="color:var(--text-muted)">${pkt.id}</span>
                         <span style="color:var(--text-secondary)">${pkt.time}</span>
-                        <span style="color:var(--text-secondary)">${pkt.protocol} · dur=${pkt.duration}s</span>
+                        <span style="color:${isAnomaly ? 'var(--accent-red)' : 'var(--text-secondary)'}">${pkt.protocol} · dur=${pkt.duration}s</span>
                         <span>${pkt.src_bytes.toLocaleString()}</span>
                         <span>${pkt.dst_bytes.toLocaleString()}</span>
                         <span>
@@ -656,12 +702,17 @@ DASHBOARD_HTML = r"""
                     feed.appendChild(row);
                 });
 
+                if (showAnomaliesOnly && packets.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.style.cssText = 'padding:40px;text-align:center;color:var(--text-muted);font-size:14px;';
+                    empty.textContent = 'No anomalies detected in current window. Waiting...';
+                    feed.appendChild(empty);
+                }
             } catch (e) {
                 console.error('Fetch error:', e);
             }
         }
 
-        // Initial fetch + auto-refresh
         fetchData();
         setInterval(fetchData, 2000);
     </script>
